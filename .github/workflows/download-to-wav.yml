@@ -1,0 +1,47 @@
+name: Download YouTube to WAV
+
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: |
+          YouTube URL（1行に1つ）
+          例:
+          https://youtu.be/xxxxxxxxxxx
+          https://www.youtube.com/watch?v=xxxxxxxxxxx
+        required: true
+        type: string
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Deno
+        uses: denoland/setup-deno@v2
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download and convert to WAV
+        env:
+          URLS: ${{ inputs.urls }}
+        run: printf '%s\n' "$URLS" | python download_to_wav.py --stdin
+
+      - name: Upload WAV artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: wav-${{ github.run_number }}
+          path: wav/
+          if-no-files-found: warn

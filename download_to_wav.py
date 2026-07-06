@@ -1,0 +1,275 @@
+#!/usr/bin/env python3
+"""YouTube URL一覧からMP4を取得し、WAVに変換する。"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+import urllib.request
+from pathlib import Path
+
+from yt_dlp import YoutubeDL
+from yt_dlp.utils import random_user_agent, sanitize_filename
+
+ROOT = Path(__file__).resolve().parent
+URL_FILE = ROOT / "youtube_url.txt"
+WAV_DIR = ROOT / "wav"
+TEMP_DIR = ROOT / "tmp_mp4"
+
+VIDEO_ID_RE = re.compile(
+    r"(?:youtu\.be/|youtube\.com/(?:watch\?v=|embed/|shorts/))([A-Za-z0-9_-]{11})"
+)
+
+
+def fetch_latest_user_agent() -> str:
+    """最新のChrome (Windows) ユーザーエージェントを取得する。"""
+    try:
+        with urllib.request.urlopen(
+            "https://jnrbsn.github.io/user-agents/user-agents.json",
+            timeout=15,
+        ) as response:
+            agents = json.load(response)
+        for agent in agents:
+            if "Windows NT 10.0" in agent and "Chrome/" in agent and "Edg/" not in agent:
+                return agent
+    except Exception as exc:
+        print(f"警告: 最新UAの取得に失敗しました ({exc})。yt-dlpのUAを使用します。")
+    return random_user_agent()
+
+
+def extract_video_id(url: str) -> str | None:
+    match = VIDEO_ID_RE.search(url.strip())
+    return match.group(1) if match else None
+
+
+def extract_filename_title(title: str) -> str:
+    """タイトルの区切り文字より左側をファイル名用に使う。"""
+    for separator in ("|", "---"):
+        if separator in title:
+            return title.split(separator, 1)[0].strip()
+    return title.strip()
+
+
+def title_to_filename(title: str) -> str:
+    display = extract_filename_title(title).replace("/", "／")
+    name = sanitize_filename(display, restricted=False)
+    return name or "untitled"
+
+
+def fetch_video_info(url: str, user_agent: str) -> dict:
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "http_headers": {"User-Agent": user_agent},
+    }
+    with YoutubeDL(ydl_opts) as ydl:
+        return ydl.extract_info(url, download=False)
+
+
+def handle_existing_files(title: str, video_id: str, index: int, total: int) -> bool:
+    """既存ファイルのスキップまたはリネーム。処理済みなら True。"""
+    base = title_to_filename(title)
+    legacy = WAV_DIR / f"{video_id}.wav"
+    primary = WAV_DIR / f"{base}.wav"
+    alt = WAV_DIR / f"{base}_{video_id}.wav"
+
+    if legacy.exists():
+        if not primary.exists():
+            legacy.rename(primary)
+            print(f"[{index}/{total}] リネーム: {legacy.name} → {primary.name}")
+            return True
+        if not alt.exists():
+            legacy.rename(alt)
+            print(f"[{index}/{total}] リネーム: {legacy.name} → {alt.name}")
+            return True
+        legacy.unlink()
+        print(f"[{index}/{total}] スキップ: 同一内容の別名ファイルあり ({alt.name})")
+        return True
+
+    for path in (primary, alt):
+        if path.exists():
+            print(f"[{index}/{total}] スキップ: 既に存在します: {path.name}")
+            return True
+    return False
+
+
+def new_wav_path(title: str, video_id: str) -> Path:
+    base = title_to_filename(title)
+    primary = WAV_DIR / f"{base}.wav"
+    if not primary.exists():
+        return primary
+    return WAV_DIR / f"{base}_{video_id}.wav"
+
+
+def parse_urls_from_text(text: str) -> list[str]:
+    urls: list[str] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            urls.append(line)
+    return urls
+
+
+def load_urls(path: Path) -> list[str]:
+    if not path.exists():
+        raise FileNotFoundError(f"URLファイルが見つかりません: {path}")
+    return parse_urls_from_text(path.read_text(encoding="utf-8"))
+
+
+def resolve_urls(args: argparse.Namespace) -> list[str]:
+    if args.stdin:
+        return parse_urls_from_text(sys.stdin.read())
+
+    urls: list[str] = []
+    if args.urls:
+        urls.extend(parse_urls_from_text(args.urls))
+    if args.file:
+        urls.extend(load_urls(Path(args.file)))
+    elif not args.url and not args.urls and URL_FILE.exists():
+        urls.extend(load_urls(URL_FILE))
+    urls.extend(args.url)
+
+    seen: set[str] = set()
+    unique_urls: list[str] = []
+    for url in urls:
+        if url not in seen:
+            seen.add(url)
+            unique_urls.append(url)
+    return unique_urls
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="YouTube URLからMP4を取得しWAVに変換する")
+    parser.add_argument("url", nargs="*", help="YouTube URL")
+    parser.add_argument("-f", "--file", help="URL一覧ファイル")
+    parser.add_argument("-u", "--urls", help="改行区切りのURL文字列")
+    parser.add_argument("--stdin", action="store_true", help="標準入力からURLを読み込む")
+    return parser
+
+
+def download_mp4(url: str, video_id: str, user_agent: str, temp_dir: Path) -> Path:
+    output_template = str(temp_dir / f"{video_id}.%(ext)s")
+    ydl_opts = {
+        "format": "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio/best",
+        "outtmpl": output_template,
+        "merge_output_format": "mp4",
+        "quiet": False,
+        "no_warnings": False,
+        "http_headers": {"User-Agent": user_agent},
+    }
+
+    with YoutubeDL(ydl_opts) as ydl:
+        ydl.download([url])
+
+    mp4_path = temp_dir / f"{video_id}.mp4"
+    if not mp4_path.exists():
+        candidates = list(temp_dir.glob(f"{video_id}.*"))
+        if not candidates:
+            raise FileNotFoundError(f"MP4のダウンロードに失敗しました: {url}")
+        mp4_path = candidates[0]
+    return mp4_path
+
+
+def convert_to_wav(mp4_path: Path, wav_path: Path) -> None:
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(mp4_path),
+        "-vn",
+        "-acodec",
+        "pcm_s16le",
+        "-ar",
+        "44100",
+        "-ac",
+        "2",
+        str(wav_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg変換失敗:\n{result.stderr}")
+
+
+def process_url(url: str, index: int, total: int, user_agent: str) -> tuple[bool, str | None]:
+    video_id = extract_video_id(url)
+    if not video_id:
+        print(f"[{index}/{total}] スキップ: 動画IDを抽出できません: {url}")
+        return False, url
+
+    try:
+        info = fetch_video_info(url, user_agent)
+        title = info.get("title") or video_id
+    except Exception as exc:
+        print(f"[{index}/{total}] エラー: {video_id} - タイトル取得失敗: {exc}", file=sys.stderr)
+        return False, url
+
+    existing = handle_existing_files(title, video_id, index, total)
+    if existing:
+        return True, None
+
+    wav_path = new_wav_path(title, video_id)
+    print(f"[{index}/{total}] 処理開始: {title} ({url})")
+
+    mp4_path: Path | None = None
+    try:
+        mp4_path = download_mp4(url, video_id, user_agent, TEMP_DIR)
+        convert_to_wav(mp4_path, wav_path)
+        print(f"[{index}/{total}] 完了: {wav_path.name}")
+        return True, None
+    except Exception as exc:
+        print(f"[{index}/{total}] エラー: {title} - {exc}", file=sys.stderr)
+        if wav_path.exists():
+            wav_path.unlink()
+        return False, url
+    finally:
+        if mp4_path and mp4_path.exists():
+            mp4_path.unlink()
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+
+    WAV_DIR.mkdir(exist_ok=True)
+    TEMP_DIR.mkdir(exist_ok=True)
+
+    user_agent = fetch_latest_user_agent()
+    print(f"User-Agent: {user_agent}\n")
+
+    try:
+        urls = resolve_urls(args)
+    except FileNotFoundError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+
+    if not urls:
+        print("処理対象のURLがありません。", file=sys.stderr)
+        return 1
+
+    total = len(urls)
+    print(f"URL数: {total}（直列処理）\n")
+
+    success = 0
+    failed = 0
+    failed_urls: list[str] = []
+    for index, url in enumerate(urls, start=1):
+        ok, failed_url = process_url(url, index, total, user_agent)
+        if ok:
+            success += 1
+        else:
+            failed += 1
+            if failed_url:
+                failed_urls.append(failed_url)
+
+    print(f"\n処理完了: 成功 {success} / 失敗 {failed} / 合計 {total}")
+    if failed_urls:
+        print("\n失敗したURL:")
+        for failed_url in failed_urls:
+            print(failed_url)
+    return 0 if failed == 0 else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
