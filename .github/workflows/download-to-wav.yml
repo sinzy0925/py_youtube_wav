@@ -33,10 +33,26 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r requirements.txt
 
+      - name: Prepare YouTube cookies
+        env:
+          YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
+        run: |
+          if [ -n "$YOUTUBE_COOKIES" ]; then
+            printf '%s' "$YOUTUBE_COOKIES" > cookies.txt
+            echo "YouTube cookies file created."
+          else
+            echo "::warning::YOUTUBE_COOKIES secret is not set. YouTube may block downloads from GitHub Actions."
+          fi
+
       - name: Download and convert to WAV
         env:
           URLS: ${{ inputs.urls }}
-        run: printf '%s\n' "$URLS" | python download_to_wav.py --stdin
+        run: |
+          COOKIE_ARG=()
+          if [ -f cookies.txt ]; then
+            COOKIE_ARG=(--cookies cookies.txt)
+          fi
+          printf '%s\n' "$URLS" | python download_to_wav.py --stdin "${COOKIE_ARG[@]}"
 
       - name: Upload WAV artifacts
         uses: actions/upload-artifact@v4

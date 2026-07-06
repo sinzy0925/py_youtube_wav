@@ -1,6 +1,7 @@
 wav/
 wav_*/
 tmp_mp4/
+cookies.txt
 __pycache__/
 *.pyc
 .DS_Store

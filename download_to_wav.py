@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import platform
 import re
 import subprocess
 import sys
@@ -25,7 +26,8 @@ VIDEO_ID_RE = re.compile(
 
 
 def fetch_latest_user_agent() -> str:
-    """最新のChrome (Windows) ユーザーエージェントを取得する。"""
+    """最新のChrome ユーザーエージェントを取得する。"""
+    os_hint = "Windows NT 10.0" if platform.system() == "Windows" else "X11; Linux x86_64"
     try:
         with urllib.request.urlopen(
             "https://jnrbsn.github.io/user-agents/user-agents.json",
@@ -33,11 +35,26 @@ def fetch_latest_user_agent() -> str:
         ) as response:
             agents = json.load(response)
         for agent in agents:
-            if "Windows NT 10.0" in agent and "Chrome/" in agent and "Edg/" not in agent:
+            if os_hint in agent and "Chrome/" in agent and "Edg/" not in agent:
                 return agent
     except Exception as exc:
         print(f"警告: 最新UAの取得に失敗しました ({exc})。yt-dlpのUAを使用します。")
     return random_user_agent()
+
+
+def build_ydl_opts(user_agent: str, cookies: Path | None = None, *, quiet: bool = False) -> dict:
+    opts: dict = {
+        "http_headers": {"User-Agent": user_agent},
+        "quiet": quiet,
+        "no_warnings": quiet,
+        "retries": 10,
+        "fragment_retries": 10,
+        "sleep_interval": 1,
+        "max_sleep_interval": 5,
+    }
+    if cookies and cookies.exists():
+        opts["cookiefile"] = str(cookies)
+    return opts
 
 
 def extract_video_id(url: str) -> str | None:
@@ -59,12 +76,8 @@ def title_to_filename(title: str) -> str:
     return name or "untitled"
 
 
-def fetch_video_info(url: str, user_agent: str) -> dict:
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "http_headers": {"User-Agent": user_agent},
-    }
+def fetch_video_info(url: str, user_agent: str, cookies: Path | None = None) -> dict:
+    ydl_opts = build_ydl_opts(user_agent, cookies, quiet=True)
     with YoutubeDL(ydl_opts) as ydl:
         return ydl.extract_info(url, download=False)
 
@@ -147,18 +160,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-f", "--file", help="URL一覧ファイル")
     parser.add_argument("-u", "--urls", help="改行区切りのURL文字列")
     parser.add_argument("--stdin", action="store_true", help="標準入力からURLを読み込む")
+    parser.add_argument(
+        "--cookies",
+        help="YouTube cookies.txt（Netscape形式）。GitHub Actionsでは secrets から渡す",
+    )
     return parser
 
 
-def download_mp4(url: str, video_id: str, user_agent: str, temp_dir: Path) -> Path:
+def download_mp4(
+    url: str,
+    video_id: str,
+    user_agent: str,
+    temp_dir: Path,
+    cookies: Path | None = None,
+) -> Path:
     output_template = str(temp_dir / f"{video_id}.%(ext)s")
     ydl_opts = {
+        **build_ydl_opts(user_agent, cookies, quiet=False),
         "format": "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio/best",
         "outtmpl": output_template,
         "merge_output_format": "mp4",
-        "quiet": False,
-        "no_warnings": False,
-        "http_headers": {"User-Agent": user_agent},
     }
 
     with YoutubeDL(ydl_opts) as ydl:
@@ -193,14 +214,20 @@ def convert_to_wav(mp4_path: Path, wav_path: Path) -> None:
         raise RuntimeError(f"ffmpeg変換失敗:\n{result.stderr}")
 
 
-def process_url(url: str, index: int, total: int, user_agent: str) -> tuple[bool, str | None]:
+def process_url(
+    url: str,
+    index: int,
+    total: int,
+    user_agent: str,
+    cookies: Path | None = None,
+) -> tuple[bool, str | None]:
     video_id = extract_video_id(url)
     if not video_id:
         print(f"[{index}/{total}] スキップ: 動画IDを抽出できません: {url}")
         return False, url
 
     try:
-        info = fetch_video_info(url, user_agent)
+        info = fetch_video_info(url, user_agent, cookies)
         title = info.get("title") or video_id
     except Exception as exc:
         print(f"[{index}/{total}] エラー: {video_id} - タイトル取得失敗: {exc}", file=sys.stderr)
@@ -215,7 +242,7 @@ def process_url(url: str, index: int, total: int, user_agent: str) -> tuple[bool
 
     mp4_path: Path | None = None
     try:
-        mp4_path = download_mp4(url, video_id, user_agent, TEMP_DIR)
+        mp4_path = download_mp4(url, video_id, user_agent, TEMP_DIR, cookies)
         convert_to_wav(mp4_path, wav_path)
         print(f"[{index}/{total}] 完了: {wav_path.name}")
         return True, None
@@ -235,8 +262,16 @@ def main(argv: list[str] | None = None) -> int:
     WAV_DIR.mkdir(exist_ok=True)
     TEMP_DIR.mkdir(exist_ok=True)
 
+    cookies = Path(args.cookies) if args.cookies else None
+    if cookies and not cookies.exists():
+        print(f"Cookieファイルが見つかりません: {cookies}", file=sys.stderr)
+        return 1
+
     user_agent = fetch_latest_user_agent()
-    print(f"User-Agent: {user_agent}\n")
+    print(f"User-Agent: {user_agent}")
+    if cookies:
+        print(f"Cookies: {cookies}")
+    print()
 
     try:
         urls = resolve_urls(args)
@@ -255,7 +290,7 @@ def main(argv: list[str] | None = None) -> int:
     failed = 0
     failed_urls: list[str] = []
     for index, url in enumerate(urls, start=1):
-        ok, failed_url = process_url(url, index, total, user_agent)
+        ok, failed_url = process_url(url, index, total, user_agent, cookies)
         if ok:
             success += 1
         else:
