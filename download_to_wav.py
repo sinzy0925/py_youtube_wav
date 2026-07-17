@@ -10,6 +10,7 @@ import re
 import subprocess
 import sys
 import urllib.request
+from collections.abc import Callable
 from pathlib import Path
 
 from yt_dlp import YoutubeDL
@@ -19,6 +20,7 @@ ROOT = Path(__file__).resolve().parent
 URL_FILE = ROOT / "youtube_url.txt"
 WAV_DIR = ROOT / "wav"
 TEMP_DIR = ROOT / "tmp_mp4"
+MAX_RETRIES = 2
 
 VIDEO_ID_RE = re.compile(
     r"(?:youtu\.be/|youtube\.com/(?:watch\?v=|embed/|shorts/))([A-Za-z0-9_-]{11})"
@@ -74,6 +76,59 @@ def title_to_filename(title: str) -> str:
     display = extract_filename_title(title).replace("/", "／")
     name = sanitize_filename(display, restricted=False)
     return name or "untitled"
+
+
+def fetch_playlist_entries(
+    playlist_url: str,
+    user_agent: str,
+    cookies: Path | None = None,
+) -> tuple[str, list[dict]]:
+    """プレイリストのタイトルと動画一覧（プレイリスト順）を取得する。"""
+    ydl_opts = {
+        **build_ydl_opts(user_agent, cookies, quiet=True),
+        "extract_flat": "in_playlist",
+        "lazy_playlist": False,
+    }
+    with YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(playlist_url.strip(), download=False)
+
+    playlist_title = info.get("title") or "playlist"
+    entries: list[dict] = []
+    for index, entry in enumerate(info.get("entries") or [], start=1):
+        if not entry:
+            continue
+        video_id = entry.get("id")
+        if not video_id:
+            continue
+        url = entry.get("url") or entry.get("webpage_url")
+        if not url:
+            url = f"https://www.youtube.com/watch?v={video_id}"
+        title = entry.get("title") or video_id
+        entries.append(
+            {
+                "index": index,
+                "url": url,
+                "title": title,
+                "video_id": video_id,
+            }
+        )
+    return playlist_title, entries
+
+
+def numbered_wav_path(
+    output_dir: Path,
+    index: int,
+    total: int,
+    title: str,
+    video_id: str,
+) -> Path:
+    width = max(2, len(str(total)))
+    prefix = f"{index:0{width}d}"
+    base = title_to_filename(title)
+    primary = output_dir / f"{prefix} - {base}.wav"
+    if not primary.exists():
+        return primary
+    return output_dir / f"{prefix} - {base}_{video_id}.wav"
 
 
 def fetch_video_info(url: str, user_agent: str, cookies: Path | None = None) -> dict:
@@ -164,6 +219,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--cookies",
         help="YouTube cookies.txt（Netscape形式）。GitHub Actionsでは secrets から渡す",
     )
+    parser.add_argument(
+        "--playlist",
+        help="YouTubeプレイリストURL（プレイリスト順に番号付きで専用フォルダへ出力）",
+    )
     return parser
 
 
@@ -212,6 +271,115 @@ def convert_to_wav(mp4_path: Path, wav_path: Path) -> None:
     result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if result.returncode != 0:
         raise RuntimeError(f"ffmpeg変換失敗:\n{result.stderr}")
+
+
+def with_retries(
+    label: str,
+    fn: Callable[[], tuple[bool, str | None]],
+) -> tuple[bool, str | None]:
+    """失敗時に最大 MAX_RETRIES 回まで再試行する。"""
+    result: tuple[bool, str | None] = (False, None)
+    for attempt in range(MAX_RETRIES + 1):
+        if attempt > 0:
+            print(f"{label} リトライ {attempt}/{MAX_RETRIES}")
+        result = fn()
+        if result[0]:
+            return result
+    return result
+
+
+def process_playlist_entry(
+    entry: dict,
+    total: int,
+    user_agent: str,
+    output_dir: Path,
+    cookies: Path | None = None,
+) -> tuple[bool, str | None]:
+    index = entry["index"]
+    url = entry["url"]
+    video_id = entry["video_id"]
+    title = entry["title"]
+
+    width = max(2, len(str(total)))
+    prefix = f"{index:0{width}d}"
+    existing = sorted(output_dir.glob(f"{prefix} - *.wav"))
+    if existing:
+        print(f"[{index}/{total}] スキップ: 既に存在します: {existing[0].name}")
+        return True, None
+
+    try:
+        info = fetch_video_info(url, user_agent, cookies)
+        title = info.get("title") or title
+    except Exception as exc:
+        print(f"[{index}/{total}] エラー: {video_id} - タイトル取得失敗: {exc}", file=sys.stderr)
+        return False, url
+
+    wav_path = numbered_wav_path(output_dir, index, total, title, video_id)
+    print(f"[{index}/{total}] 処理開始: {title} ({url})")
+
+    mp4_path: Path | None = None
+    try:
+        mp4_path = download_mp4(url, video_id, user_agent, TEMP_DIR, cookies)
+        convert_to_wav(mp4_path, wav_path)
+        print(f"[{index}/{total}] 完了: {wav_path}")
+        return True, None
+    except Exception as exc:
+        print(f"[{index}/{total}] エラー: {title} - {exc}", file=sys.stderr)
+        if wav_path.exists():
+            wav_path.unlink()
+        return False, url
+    finally:
+        if mp4_path and mp4_path.exists():
+            mp4_path.unlink()
+
+
+def run_playlist(
+    playlist_url: str,
+    user_agent: str,
+    cookies: Path | None = None,
+) -> int:
+    try:
+        playlist_title, entries = fetch_playlist_entries(playlist_url, user_agent, cookies)
+    except Exception as exc:
+        print(f"プレイリスト取得失敗: {exc}", file=sys.stderr)
+        return 1
+
+    if not entries:
+        print("プレイリストに動画がありません。", file=sys.stderr)
+        return 1
+
+    output_dir = WAV_DIR / title_to_filename(playlist_title)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    total = len(entries)
+    print(f"プレイリスト: {playlist_title}")
+    print(f"出力先: {output_dir}")
+    print(f"動画数: {total}（直列処理）\n")
+
+    success = 0
+    failed = 0
+    failed_urls: list[str] = []
+    for entry in entries:
+        index = entry["index"]
+        ok, failed_url = with_retries(
+            f"[{index}/{total}]",
+            lambda entry=entry: process_playlist_entry(
+                entry, total, user_agent, output_dir, cookies
+            ),
+        )
+        if ok:
+            success += 1
+        else:
+            failed += 1
+            if failed_url:
+                failed_urls.append(failed_url)
+
+    print(f"\n処理完了: 成功 {success} / 失敗 {failed} / 合計 {total}")
+    if failed_urls:
+        print("\n失敗したURL:")
+        for failed_url in failed_urls:
+            print(failed_url)
+    return 0 if failed == 0 else 1
 
 
 def process_url(
@@ -273,6 +441,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Cookies: {cookies}")
     print()
 
+    if args.playlist:
+        return run_playlist(args.playlist, user_agent, cookies)
+
     try:
         urls = resolve_urls(args)
     except FileNotFoundError as exc:
@@ -290,7 +461,12 @@ def main(argv: list[str] | None = None) -> int:
     failed = 0
     failed_urls: list[str] = []
     for index, url in enumerate(urls, start=1):
-        ok, failed_url = process_url(url, index, total, user_agent, cookies)
+        ok, failed_url = with_retries(
+            f"[{index}/{total}]",
+            lambda url=url, index=index: process_url(
+                url, index, total, user_agent, cookies
+            ),
+        )
         if ok:
             success += 1
         else:
